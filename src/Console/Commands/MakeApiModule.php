@@ -25,6 +25,8 @@ class MakeApiModule extends Command
         $name = $this->argument('name');
         $version = strtoupper($this->argument('version'));
         $modelName = Str::studly($name);
+        $storeRequest = "Store{$modelName}Request";
+        $updateRequest = "Update{$modelName}Request";
 
         // Ensure the Model exists before proceeding
         $modelClass = "App\\Models\\{$modelName}";
@@ -36,8 +38,13 @@ class MakeApiModule extends Command
         $this->info("🚀 Scaffolding API Module: {$modelName} ({$version})");
 
         // 1. Create Requests
-        $this->createRequest($modelName, "Store{$modelName}Request", 'store', $modelClass);
-        $this->createRequest($modelName, "Update{$modelName}Request", 'update', $modelClass);
+        // $this->createRequest($modelName, "Store{$modelName}Request", 'store', $modelClass);
+        // $this->createRequest($modelName, "Update{$modelName}Request", 'update', $modelClass);
+        $this->call('make:request', ['name' => $storeRequest]);
+        $this->createRequest($storeRequest, 'store', $modelClass);
+        $this->call('make:request', ['name' => $updateRequest]);
+        $this->createRequest($updateRequest, 'update', $modelClass);
+
 
         // 2. Create Resource
         $this->createResource($modelName);
@@ -54,7 +61,7 @@ class MakeApiModule extends Command
         // 5. Append Routes
         $this->appendRoutes($modelName, $version);
 
-        $this->info("✅ API Module for {$modelName} is ready for Day 2 logic!");
+        $this->info("✅ API Module for {$modelName} is ready");
     }
 
 
