@@ -59,7 +59,7 @@ class MakeApiModule extends Command
 
 
 
-    protected function createRequest1($modelName, $requestName, $type, $modelClass)
+    protected function createRequest($modelName, $requestName, $type, $modelClass)
     {
         $path = app_path("Http/Requests/{$requestName}.php");
         if ($this->files->exists($path)) {
