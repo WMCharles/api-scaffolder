@@ -59,16 +59,85 @@ class MakeApiModule extends Command
 
 
 
-    protected function createRequest($modelName, $requestName, $type, $modelClass)
+    protected function populateRequest($requestName, $type, $modelClass)
     {
         $path = app_path("Http/Requests/{$requestName}.php");
-        if ($this->files->exists($path)) {
-            $this->warn("- Request {$requestName} already exists. Skipping.");
-            return;
+        $table = (new $modelClass)->getTable();
+
+        $migrationFiles = glob(database_path("migrations/*.php"));
+
+        $columns = [];
+
+        foreach ($migrationFiles as $file) {
+            $content = file_get_contents($file);
+
+            // Only parse files that create the target table
+            if (!str_contains($content, "Schema::create('{$table}'")) continue;
+
+            // Match lines like: $table->string('name')->nullable();
+            preg_match_all("/\\\$table->(\w+)\\('([\w_]+)'\\)(->nullable\\(\\))?/", $content, $matches, PREG_SET_ORDER);
+
+            foreach ($matches as $match) {
+                $typeName = $match[1];
+                $columnName = $match[2];
+                $nullable = isset($match[3]) && $match[3] === '->nullable()';
+                $columns[$columnName] = [
+                    'type' => $typeName,
+                    'nullable' => $nullable,
+                ];
+            }
         }
 
-        $table = (new $modelClass)->getTable();
-        $rules = $this->generateRules($table, $type);
+        $rules = [];
+
+        foreach ($columns as $name => $column) {
+            if (in_array($name, ['id', 'created_at', 'updated_at', 'deleted_at'])) continue;
+
+            $nullable = $column['nullable'];
+            $rulePrefix = ($type === 'store') ? ($nullable ? 'sometimes' : 'required') : 'sometimes';
+            $typeName = $column['type'];
+
+            $rules[$name] = [$rulePrefix];
+
+            switch ($typeName) {
+                case 'string':
+                case 'text':
+                    $rules[$name][] = 'string';
+                    break;
+                case 'integer':
+                case 'bigInteger':
+                case 'smallInteger':
+                    $rules[$name][] = 'integer';
+                    break;
+                case 'decimal':
+                case 'float':
+                    $rules[$name][] = 'numeric';
+                    break;
+                case 'boolean':
+                    $rules[$name][] = 'boolean';
+                    break;
+                case 'date':
+                case 'dateTime':
+                case 'timestamp':
+                    $rules[$name][] = 'date';
+                    break;
+                case 'json':
+                    $rules[$name][] = 'array';
+                    break;
+            }
+
+            // Add unique validation for store request on 'code' or 'slug'
+            if ($type === 'store' && in_array($name, ['code', 'slug'])) {
+                $rules[$name][] = "unique:{$table},{$name}";
+            }
+        }
+
+        // Convert rules array to string for stub
+        $rulesString = implode(",\n            ", array_map(
+            fn($k, $v) => "'" . $k . "' => ['" . implode("','", $v) . "']",
+            array_keys($rules),
+            $rules
+        ));
 
         $stub = "<?php
 
@@ -78,17 +147,22 @@ use Illuminate\Foundation\Http\FormRequest;
 
 class {$requestName} extends FormRequest
 {
-    public function authorize(): bool { return true; }
+    public function authorize(): bool
+    {
+        return true;
+    }
 
     public function rules(): array
     {
         return [
-            {$rules}
+            {$rulesString}
         ];
     }
-}";
+}
+";
+
         $this->files->put($path, $stub);
-        $this->info("- Created Request: {$requestName}");
+        $this->info("Request [{$path}] created successfully.");
     }
 
     protected function createResource($modelName)
