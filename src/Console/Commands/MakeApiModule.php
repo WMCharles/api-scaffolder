@@ -59,7 +59,7 @@ class MakeApiModule extends Command
 
 
 
-    protected function populateRequest($requestName, $type, $modelClass)
+    protected function createRequest($requestName, $type, $modelClass)
     {
         $path = app_path("Http/Requests/{$requestName}.php");
         $table = (new $modelClass)->getTable();
