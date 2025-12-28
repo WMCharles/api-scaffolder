@@ -57,7 +57,74 @@ class MakeApiModule extends Command
         $this->info("✅ API Module for {$modelName} is ready for Day 2 logic!");
     }
 
-    protected function createRequest($modelName, $requestName, $type, $modelClass)
+    protected function generateRules($table, $type)
+    {
+        // 1. Get the column list from the actual database table
+        // Note: The migration MUST be run (php artisan migrate) for this to work
+        try {
+            $columns = Schema::getColumnListing($table);
+        } catch (\Exception $e) {
+            $this->error("Could not read table '{$table}'. Ensure you have run php artisan migrate.");
+            return "'name' => ['required', 'string']"; // Fallback
+        }
+
+        $rules = "";
+
+        // 2. Define columns to skip (System columns)
+        $exclude = ['id', 'created_at', 'updated_at', 'deleted_at', 'user_id', 'email_verified_at'];
+
+        foreach ($columns as $column) {
+            if (in_array($column, $exclude)) continue;
+
+            // Get column metadata (requires doctrine/dbal)
+            $columnType = Schema::getColumnType($table, $column);
+            $isNullable = !Schema::getConnection()->getDoctrineColumn($table, $column)->getNotnull();
+
+            // Start building the rule string
+            $ruleArray = [];
+
+            // Requirement logic
+            if ($type === 'store') {
+                $ruleArray[] = $isNullable ? "'sometimes'" : "'required'";
+            } else {
+                $ruleArray[] = "'sometimes'";
+            }
+
+            // Type guessing logic
+            switch ($columnType) {
+                case 'integer':
+                case 'bigint':
+                case 'smallint':
+                    $ruleArray[] = "'integer'";
+                    break;
+                case 'boolean':
+                    $ruleArray[] = "'boolean'";
+                    break;
+                case 'decimal':
+                case 'float':
+                    $ruleArray[] = "'numeric'";
+                    break;
+                case 'datetime':
+                case 'date':
+                    $ruleArray[] = "'date'";
+                    break;
+                default:
+                    $ruleArray[] = "'string'";
+                    $ruleArray[] = "'max:255'";
+            }
+
+            // Check for uniqueness (common for 'slug', 'code', 'email')
+            if (in_array($column, ['slug', 'code', 'email'])) {
+                $ruleArray[] = "'unique:{$table},{$column}'";
+            }
+
+            $rules .= "\n            '{$column}' => [" . implode(", ", $ruleArray) . "],";
+        }
+
+        return trim($rules);
+    }
+
+    protected function createRequest1($modelName, $requestName, $type, $modelClass)
     {
         $path = app_path("Http/Requests/{$requestName}.php");
         if ($this->files->exists($path)) {
