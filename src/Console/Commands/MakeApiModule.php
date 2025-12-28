@@ -208,6 +208,148 @@ class {$modelName}Resource extends JsonResource
         $modelClass = "App\\Models\\{$modelName}";
         $tableName = (new $modelClass)->getTable();
 
+        // Detect Relations for Eager Loading
+        $relations = [];
+        $reflection = new \ReflectionClass($modelClass);
+        foreach ($reflection->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
+            if ($method->getDeclaringClass()->getName() === $modelClass && $method->getNumberOfParameters() === 0) {
+                $relations[] = $method->getName();
+            }
+        }
+        $with = count($relations) ? "with(['" . implode("','", $relations) . "'])" : "query()";
+
+        $stub = "<?php
+
+namespace App\Http\Controllers\Api\\{$version};
+
+use App\Http\Controllers\Controller;
+use App\Models\\{$modelName};
+use App\Http\Requests\Store{$modelName}Request;
+use App\Http\Requests\Update{$modelName}Request;
+use App\Http\Resources\\{$modelName}Resource;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Schema;
+
+class {$controllerName} extends Controller
+{
+    /**
+     * Display a paginated listing of the resource.
+     */
+    public function index(Request \$request)
+    {
+        \$perPage = \$request->get('per_page', 15);
+        \${$variable}s = {$modelName}::{$with}->paginate(\$perPage);
+
+        return {$modelName}Resource::collection(\${$variable}s)->additional([
+            'status' => 'success',
+            'message' => 'Records retrieved successfully'
+        ]);
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     */
+    public function store(Store{$modelName}Request \$request)
+    {
+        \$data = \$request->validated();
+
+        // Assign authenticated user_id via Sanctum if column exists
+        if (Schema::hasColumn('{$tableName}', 'user_id')) {
+            \$data['user_id'] = \$request->user()->id;
+        }
+
+        \${$variable} = {$modelName}::create(\$data);
+        
+        return (new {$modelName}Resource(\${$variable}))
+            ->additional([
+                'status' => 'success',
+                'message' => 'Record created successfully'
+            ])
+            ->response()
+            ->setStatusCode(201);
+    }
+
+    /**
+     * Display the specified resource.
+     */
+    public function show(\$id)
+    {
+        \${$variable} = {$modelName}::{$with}->find(\$id);
+        
+        if (!\${$variable}) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Record not found'
+            ], 404);
+        }
+
+        return (new {$modelName}Resource(\${$variable}))->additional([
+            'status' => 'success'
+        ]);
+    }
+
+    /**
+     * Update the specified resource in storage.
+     */
+    public function update(Update{$modelName}Request \$request, \$id)
+    {
+        \${$variable} = {$modelName}::find(\$id);
+
+        if (!\${$variable}) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Record not found'
+            ], 404);
+        }
+        
+        \${$variable}->update(\$request->validated());
+        
+        return (new {$modelName}Resource(\${$variable}))->additional([
+            'status' => 'success',
+            'message' => 'Record updated successfully'
+        ]);
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     */
+    public function destroy(\$id)
+    {
+        \${$variable} = {$modelName}::find(\$id);
+
+        if (!\${$variable}) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Record not found'
+            ], 404);
+        }
+
+        \${$variable}->delete();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Record deleted successfully'
+        ]);
+    }
+}";
+        $this->files->put($path, $stub);
+    }
+
+    protected function createControllerx($modelName, $version)
+    {
+        $dir = app_path("Http/Controllers/Api/{$version}");
+        if (!$this->files->isDirectory($dir)) {
+            $this->files->makeDirectory($dir, 0755, true);
+        }
+
+        $controllerName = "{$modelName}Controller";
+        $path = "{$dir}/{$controllerName}.php";
+
+        $variable = Str::camel($modelName);
+        $modelClass = "App\\Models\\{$modelName}";
+        $tableName = (new $modelClass)->getTable();
+
         // Basic relation detection
         $relations = [];
         $reflection = new \ReflectionClass($modelClass);
