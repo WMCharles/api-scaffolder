@@ -1,0 +1,22 @@
+{
+    "name": "charlesmasinde/api-scaffolder",
+    "description": "Custom API Module generator for Laravel 12",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "CharlesMasinde\\ApiScaffolder\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "CharlesMasinde\\ApiScaffolder\\ApiScaffolderServiceProvider"
+            ]
+        }
+    },
+    "require": {
+        "php": "^8.2",
+        "laravel/framework": "^11.0|^12.0"
+    }
+}
