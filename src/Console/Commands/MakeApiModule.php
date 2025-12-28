@@ -5,6 +5,7 @@ namespace CharlesMasinde\ApiScaffolder\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Str;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Schema;
 
 class MakeApiModule extends Command
 {
@@ -122,6 +123,7 @@ class {$modelName}Resource extends JsonResource
 
         $variable = Str::camel($modelName);
         $modelClass = "App\\Models\\{$modelName}";
+        $tableName = (new $modelClass)->getTable();
 
         // Basic relation detection
         $relations = [];
@@ -142,7 +144,9 @@ use App\Models\\{$modelName};
 use App\Http\Requests\Store{$modelName}Request;
 use App\Http\Requests\Update{$modelName}Request;
 use App\Http\Resources\\{$modelName}Resource;
+use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Schema;
 
 class {$controllerName} extends Controller
 {
@@ -154,9 +158,10 @@ class {$controllerName} extends Controller
     public function store(Store{$modelName}Request \$request)
     {
         \$data = \$request->validated();
-        // Audit logic: if table has user_id, assign it
-        if (\\Schema::hasColumn('" . (new $modelClass)->getTable() . "', 'user_id')) {
-            \$data['user_id'] = auth()->id() ?? 1;
+
+        // Sanctum API Logic: Automatically assign user_id from the authenticated token
+        if (Schema::hasColumn('{$tableName}', 'user_id')) {
+            \$data['user_id'] = \$request->user()->id;
         }
 
         \${$variable} = {$modelName}::create(\$data);
@@ -196,7 +201,8 @@ class {$controllerName} extends Controller
         $vLower = strtolower($version);
         $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
 
-        $route = "\nRoute::prefix('{$vLower}')->group(function () {\n    Route::apiResource('{$slug}', \\{$controller}::class);\n});";
+        // Wrapped in auth:sanctum for security
+        $route = "\nRoute::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {\n    Route::apiResource('{$slug}', \\{$controller}::class);\n});";
 
         $this->files->append($routeFile, $route);
         $this->info("- Appended routes to api.php");
@@ -204,10 +210,9 @@ class {$controllerName} extends Controller
 
     protected function generateRules($table, $type)
     {
-        // Simple heuristic rules based on standard column naming
-        // For a 3-day sprint, this handles 90% of cases
+        // Removed user_id from rules to prevent manual injection via API payload
         return "'name' => ['" . ($type == 'store' ? 'required' : 'sometimes') . "', 'string', 'max:255'],
             'code' => ['sometimes', 'string', 'unique:{$table},code'],
-            'user_id' => ['nullable', 'exists:users,id'],";
+            'description' => ['nullable', 'string'],";
     }
 }
