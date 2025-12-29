@@ -41,9 +41,9 @@ class MakeApiModule extends Command
         // $this->createRequest($modelName, "Store{$modelName}Request", 'store', $modelClass);
         // $this->createRequest($modelName, "Update{$modelName}Request", 'update', $modelClass);
         $this->call('make:request', ['name' => $storeRequest]);
-        $this->createRequest($storeRequest, 'store', $modelClass);
+        $this->createRequest($modelName, $storeRequest, 'store', $modelClass);
         $this->call('make:request', ['name' => $updateRequest]);
-        $this->createRequest($updateRequest, 'update', $modelClass);
+        $this->createRequest($modelName, $updateRequest, 'update', $modelClass);
 
 
         // 2. Create Resource
@@ -66,80 +66,88 @@ class MakeApiModule extends Command
 
 
 
-    protected function createRequest($requestName, $type, $modelClass)
+    protected function createRequest($modelName, $requestName, $type, $modelClass)
     {
-        $path = app_path("Http/Requests/{$requestName}.php");
-        $table = (new $modelClass)->getTable();
+        $dir = app_path("Http/Requests");
+        if (!$this->files->isDirectory($dir)) {
+            $this->files->makeDirectory($dir, 0755, true);
+        }
 
+        $path = "{$dir}/{$requestName}.php";
+        $table = (new $modelClass)->getTable();
         $migrationFiles = glob(database_path("migrations/*.php"));
 
         $columns = [];
 
         foreach ($migrationFiles as $file) {
             $content = file_get_contents($file);
-
-            // Only parse files that create the target table
             if (!str_contains($content, "Schema::create('{$table}'")) continue;
 
-            // Match lines like: $table->string('name')->nullable();
-            preg_match_all("/\\\$table->(\w+)\\('([\w_]+)'\\)(->nullable\\(\\))?/", $content, $matches, PREG_SET_ORDER);
+            // UPDATED REGEX: Now captures the type, name, AND optional second argument (like enum options)
+            // Group 1: type, Group 2: name, Group 3: optional details (options array), Group 4: nullable
+            preg_match_all("/\\\$table->(\w+)\('([\w_]+)'(?:,\s*(.+?))?\)(->nullable\(\))?/", $content, $matches, PREG_SET_ORDER);
 
             foreach ($matches as $match) {
                 $typeName = $match[1];
                 $columnName = $match[2];
-                $nullable = isset($match[3]) && $match[3] === '->nullable()';
+                $options = $match[3] ?? null; // This will look like "['male', 'female']"
+                $nullable = isset($match[4]) && $match[4] === '->nullable()';
+
                 $columns[$columnName] = [
                     'type' => $typeName,
                     'nullable' => $nullable,
+                    'options' => $options,
                 ];
             }
         }
 
         $rules = [];
-
         foreach ($columns as $name => $column) {
-            if (in_array($name, ['id', 'created_at', 'updated_at', 'deleted_at'])) continue;
+            if (in_array($name, ['id', 'created_at', 'updated_at', 'deleted_at', 'user_id'])) continue;
 
             $nullable = $column['nullable'];
             $rulePrefix = ($type === 'store') ? ($nullable ? 'sometimes' : 'required') : 'sometimes';
             $typeName = $column['type'];
 
-            $rules[$name] = [$rulePrefix];
+            $currentRules = [$rulePrefix];
+
+            // ENUM LOGIC
+            if ($typeName === 'enum' && $column['options']) {
+                // Clean the string "['male', 'female']" to "male,female"
+                $cleanOptions = str_replace(['[', ']', "'", '"', ' '], '', $column['options']);
+                $currentRules[] = "in:{$cleanOptions}";
+            }
 
             switch ($typeName) {
                 case 'string':
                 case 'text':
-                    $rules[$name][] = 'string';
+                    $currentRules[] = 'string';
                     break;
                 case 'integer':
                 case 'bigInteger':
                 case 'smallInteger':
-                    $rules[$name][] = 'integer';
+                    $currentRules[] = 'integer';
                     break;
                 case 'decimal':
                 case 'float':
-                    $rules[$name][] = 'numeric';
+                case 'numeric':
+                    $currentRules[] = 'numeric';
                     break;
                 case 'boolean':
-                    $rules[$name][] = 'boolean';
+                    $currentRules[] = 'boolean';
                     break;
                 case 'date':
-                case 'dateTime':
-                case 'timestamp':
-                    $rules[$name][] = 'date';
-                    break;
-                case 'json':
-                    $rules[$name][] = 'array';
+                    $currentRules[] = 'date';
                     break;
             }
 
-            // Add unique validation for store request on 'code' or 'slug'
-            if ($type === 'store' && in_array($name, ['code', 'slug'])) {
-                $rules[$name][] = "unique:{$table},{$name}";
+            if ($type === 'store' && in_array($name, ['code', 'slug', 'admission_number'])) {
+                $currentRules[] = "unique:{$table},{$name}";
             }
+
+            $rules[$name] = $currentRules;
         }
 
-        // Convert rules array to string for stub
         $rulesString = implode(",\n            ", array_map(
             fn($k, $v) => "'" . $k . "' => ['" . implode("','", $v) . "']",
             array_keys($rules),
@@ -154,10 +162,7 @@ use Illuminate\Foundation\Http\FormRequest;
 
 class {$requestName} extends FormRequest
 {
-    public function authorize(): bool
-    {
-        return true;
-    }
+    public function authorize(): bool { return true; }
 
     public function rules(): array
     {
@@ -167,31 +172,72 @@ class {$requestName} extends FormRequest
     }
 }
 ";
-
         $this->files->put($path, $stub);
-        $this->info("Request [{$path}] created successfully.");
     }
 
     protected function createResource($modelName)
     {
-        $path = app_path("Http/Resources/{$modelName}Resource.php");
+        $dir = app_path("Http/Resources");
+        if (!$this->files->isDirectory($dir)) {
+            $this->files->makeDirectory($dir, 0755, true);
+        }
+
+        $path = "{$dir}/{$modelName}Resource.php";
         if ($this->files->exists($path)) return;
+
+        // 1. Get the table name from the model
+        $modelClass = "App\\Models\\{$modelName}";
+        $table = (new $modelClass)->getTable();
+
+        // 2. Fetch columns from the database
+        $columns = \Illuminate\Support\Facades\Schema::getColumnListing($table);
+
+        $mapping = [];
+        foreach ($columns as $column) {
+            // Skip timestamps and audit fields
+            if (in_array($column, ['created_at', 'updated_at', 'deleted_at', 'user_id'])) {
+                continue;
+            }
+
+            // 3. Detect Foreign Keys (e.g., student_id)
+            if (str_ends_with($column, '_id')) {
+                $relationName = \Illuminate\Support\Str::camel(str_replace('_id', '', $column));
+
+                // We provide the ID but also a placeholder for the related object
+                $mapping[] = "'{$column}' => \$this->{$column}";
+                $mapping[] = "'{$relationName}' => new " . \Illuminate\Support\Str::studly($relationName) . "Resource(\$this->whenLoaded('{$relationName}'))";
+            } else {
+                // Normal columns
+                $mapping[] = "'{$column}' => \$this->{$column}";
+            }
+        }
+
+        $mappingString = implode(",\n            ", $mapping);
 
         $stub = "<?php
 
 namespace App\Http\Resources;
 
+use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
 class {$modelName}Resource extends JsonResource
 {
-    public function toArray(\$request): array
+    /**
+     * Transform the resource into an array.
+     *
+     * @return array<string, mixed>
+     */
+    public function toArray(Request \$request): array
     {
-        return parent::toArray(\$request);
+        return [
+            {$mappingString}
+        ];
     }
-}";
+}
+";
         $this->files->put($path, $stub);
-        $this->info("- Created Resource: {$modelName}Resource");
+        $this->info("- Created Smart Resource: {$modelName}Resource");
     }
 
     protected function createController($modelName, $version)
@@ -238,7 +284,7 @@ class {$controllerName} extends Controller
      */
     public function index(Request \$request)
     {
-        \$perPage = \$request->get('per_page', 15);
+        \$perPage = \$request->get('per_page', 100);
         \${$variable}s = {$modelName}::{$with}->paginate(\$perPage);
 
         return {$modelName}Resource::collection(\${$variable}s)->additional([
