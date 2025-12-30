@@ -38,8 +38,6 @@ class MakeApiModule extends Command
         $this->info("🚀 Scaffolding API Module: {$modelName} ({$version})");
 
         // 1. Create Requests
-        // $this->createRequest($modelName, "Store{$modelName}Request", 'store', $modelClass);
-        // $this->createRequest($modelName, "Update{$modelName}Request", 'update', $modelClass);
         $this->call('make:request', ['name' => $storeRequest]);
         $this->createRequest($modelName, $storeRequest, 'store', $modelClass);
         $this->call('make:request', ['name' => $updateRequest]);
@@ -201,11 +199,20 @@ class {$requestName} extends FormRequest
 
             // 3. Detect Foreign Keys (e.g., student_id)
             if (str_ends_with($column, '_id')) {
-                $relationName = \Illuminate\Support\Str::camel(str_replace('_id', '', $column));
+                $relationBase = str_replace('_id', '', $column);
 
-                // We provide the ID but also a placeholder for the related object
+                // snake_case for the relationship name (e.g., education_phase)
+                $relationSnake = \Illuminate\Support\Str::snake($relationBase);
+
+                // camelCase for a clean JSON key (e.g., education_phase_name)
+                $jsonKey = $relationSnake . '_name';
+
+                // Add the ID field
                 $mapping[] = "'{$column}' => \$this->{$column}";
-                $mapping[] = "'{$relationName}' => new " . \Illuminate\Support\Str::studly($relationName) . "Resource(\$this->whenLoaded('{$relationName}'))";
+
+                // Add the "Smart" Name accessor using the null-safe operator
+                // This assumes the related table has a 'name' column (standard for your Mint machine)
+                $mapping[] = "'{$jsonKey}' => \$this->{$relationSnake}?->name";
             } else {
                 // Normal columns
                 $mapping[] = "'{$column}' => \$this->{$column}";
@@ -382,101 +389,47 @@ class {$controllerName} extends Controller
         $this->files->put($path, $stub);
     }
 
-    protected function createControllerx($modelName, $version)
-    {
-        $dir = app_path("Http/Controllers/Api/{$version}");
-        if (!$this->files->isDirectory($dir)) {
-            $this->files->makeDirectory($dir, 0755, true);
-        }
-
-        $controllerName = "{$modelName}Controller";
-        $path = "{$dir}/{$controllerName}.php";
-
-        $variable = Str::camel($modelName);
-        $modelClass = "App\\Models\\{$modelName}";
-        $tableName = (new $modelClass)->getTable();
-
-        // Basic relation detection
-        $relations = [];
-        $reflection = new \ReflectionClass($modelClass);
-        foreach ($reflection->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
-            if ($method->getDeclaringClass()->getName() === $modelClass && $method->getNumberOfParameters() === 0) {
-                $relations[] = $method->getName();
-            }
-        }
-        $with = count($relations) ? "with(['" . implode("','", $relations) . "'])" : "query()";
-
-        $stub = "<?php
-
-namespace App\Http\Controllers\Api\\{$version};
-
-use App\Http\Controllers\Controller;
-use App\Models\\{$modelName};
-use App\Http\Requests\Store{$modelName}Request;
-use App\Http\Requests\Update{$modelName}Request;
-use App\Http\Resources\\{$modelName}Resource;
-use Illuminate\Http\Request;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Schema;
-
-class {$controllerName} extends Controller
-{
-    public function index()
-    {
-        return {$modelName}Resource::collection({$modelName}::{$with}->get());
-    }
-
-    public function store(Store{$modelName}Request \$request)
-    {
-        \$data = \$request->validated();
-
-        // Sanctum API Logic: Automatically assign user_id from the authenticated token
-        if (Schema::hasColumn('{$tableName}', 'user_id')) {
-            \$data['user_id'] = \$request->user()->id;
-        }
-
-        \${$variable} = {$modelName}::create(\$data);
-        return response()->json(new {$modelName}Resource(\${$variable}), 201);
-    }
-
-    public function show(\$id)
-    {
-        \${$variable} = {$modelName}::{$with}->find(\$id);
-        return \${$variable} ? new {$modelName}Resource(\${$variable}) : response()->json(['message' => 'Not found'], 404);
-    }
-
-    public function update(Update{$modelName}Request \$request, \$id)
-    {
-        \${$variable} = {$modelName}::find(\$id);
-        if (!\${$variable}) return response()->json(['message' => 'Not found'], 404);
-        
-        \${$variable}->update(\$request->validated());
-        return new {$modelName}Resource(\${$variable});
-    }
-
-    public function destroy(\$id)
-    {
-        \${$variable} = {$modelName}::find(\$id);
-        if (\${$variable}) \${$variable}->delete();
-        return response()->noContent();
-    }
-}";
-        $this->files->put($path, $stub);
-        $this->info("- Created Controller: {$controllerName}");
-    }
-
     protected function appendRoutes($modelName, $version)
     {
         $routeFile = base_path('routes/api.php');
+        $content = $this->files->get($routeFile);
+
         $slug = Str::kebab(Str::plural($modelName));
         $vLower = strtolower($version);
         $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
 
-        // Wrapped in auth:sanctum for security
-        $route = "\nRoute::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {\n    Route::apiResource('{$slug}', \\{$controller}::class);\n});";
+        // The line we want to add
+        $newRoute = "    Route::apiResource('{$slug}', \\{$controller}::class);";
 
-        $this->files->append($routeFile, $route);
-        $this->info("- Appended routes to api.php");
+        // 1. Check if the resource already exists to avoid duplicates
+        if (str_contains($content, "apiResource('{$slug}'")) {
+            $this->info("- Route for {$slug} already exists.");
+            return;
+        }
+
+        // 2. Define the search pattern for the versioned group
+        $groupPattern = "Route::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {";
+
+        if (str_contains($content, $groupPattern)) {
+            // Find the position of the group
+            $pos = strpos($content, $groupPattern);
+
+            // Find the first closing brace AFTER the group declaration
+            // We use a simple approach: find the next '});' after the group starts
+            $insertPos = strpos($content, "});", $pos);
+
+            if ($insertPos !== false) {
+                // Inject the new route before the closing brace
+                $updatedContent = substr_replace($content, $newRoute . "\n", $insertPos, 0);
+                $this->files->put($routeFile, $updatedContent);
+                $this->info("- Added {$slug} to existing {$vLower} route group.");
+            }
+        } else {
+            // 3. If no group exists for this version, create a new one at the end
+            $route = "\nRoute::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {\n{$newRoute}\n});\n";
+            $this->files->append($routeFile, $route);
+            $this->info("- Created new route group for {$vLower} and added {$slug}.");
+        }
     }
 
     protected function generateRules($table, $type)
