@@ -62,8 +62,6 @@ class MakeApiModule extends Command
         $this->info("✅ API Module for {$modelName} is ready");
     }
 
-
-
     protected function createRequest($modelName, $requestName, $type, $modelClass)
     {
         $dir = app_path("Http/Requests");
@@ -283,6 +281,194 @@ use App\Http\Resources\\{$modelName}Resource;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
+
+class {$controllerName} extends Controller
+{
+    /**
+     * Display a paginated listing of the resource.
+     */
+    public function index(Request \$request)
+    {
+        \$perPage = \$request->get('per_page', 100);
+        \${$variable}s = {$modelName}::{$with}->paginate(\$perPage);
+
+        return {$modelName}Resource::collection(\${$variable}s)->additional([
+            'status' => 'success',
+            'message' => 'Records retrieved successfully'
+        ]);
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     */
+    public function store(Store{$modelName}Request \$request)
+    {
+        \$data = \$request->validated();
+
+        if (Schema::hasColumn('{$tableName}', 'user_id')) {
+            \$data['user_id'] = \$request->user()->id;
+        }
+
+        \${$variable} = {$modelName}::create(\$data);
+        
+        return (new {$modelName}Resource(\${$variable}))
+            ->additional([
+                'status' => 'success',
+                'message' => 'Record created successfully'
+            ])
+            ->response()
+            ->setStatusCode(201);
+    }
+
+    /**
+     * Bulk store multiple resources.
+     */
+    public function bulkStore(Request \$request): JsonResponse
+    {
+        \$data = \$request->all();
+        
+        // Get rules from the StoreRequest class
+        \$rules = (new Store{$modelName}Request())->rules();
+        
+        // Map rules to array syntax (e.g., 'name' becomes '*.name')
+        \$bulkRules = [];
+        foreach (\$rules as \$key => \$rule) {
+            \$bulkRules[\"*.\$key\"] = \$rule;
+        }
+
+        \$validator = Validator::make(\$data, \$bulkRules);
+
+        if (\$validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'errors' => \$validator->errors()
+            ], 422);
+        }
+
+        \$userId = \$request->user()->id;
+        \$hasUserId = Schema::hasColumn('{$tableName}', 'user_id');
+        \$createdCount = 0;
+
+        DB::transaction(function () use (\$data, \$userId, \$hasUserId, &\$createdCount) {
+            foreach (\$data as \$item) {
+                if (\$hasUserId) {
+                    \$item['user_id'] = \$userId;
+                }
+                {$modelName}::create(\$item);
+                \$createdCount++;
+            }
+        });
+
+        return response()->json([
+            'status' => 'success',
+            'message' => \"{\$createdCount} records created successfully\"
+        ], 201);
+    }
+
+    /**
+     * Display the specified resource.
+     */
+    public function show(\$id)
+    {
+        \${$variable} = {$modelName}::{$with}->find(\$id);
+        
+        if (!\${$variable}) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Record not found'
+            ], 404);
+        }
+
+        return (new {$modelName}Resource(\${$variable}))->additional([
+            'status' => 'success'
+        ]);
+    }
+
+    /**
+     * Update the specified resource in storage.
+     */
+    public function update(Update{$modelName}Request \$request, \$id)
+    {
+        \${$variable} = {$modelName}::find(\$id);
+
+        if (!\${$variable}) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Record not found'
+            ], 404);
+        }
+        
+        \${$variable}->update(\$request->validated());
+        
+        return (new {$modelName}Resource(\${$variable}))->additional([
+            'status' => 'success',
+            'message' => 'Record updated successfully'
+        ]);
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     */
+    public function destroy(\$id)
+    {
+        \${$variable} = {$modelName}::find(\$id);
+
+        if (!\${$variable}) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Record not found'
+            ], 404);
+        }
+
+        \${$variable}->delete();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Record deleted successfully'
+        ]);
+    }
+}";
+        $this->files->put($path, $stub);
+    }
+
+    protected function createControllerOld($modelName, $version)
+    {
+        $dir = app_path("Http/Controllers/Api/{$version}");
+        if (!$this->files->isDirectory($dir)) {
+            $this->files->makeDirectory($dir, 0755, true);
+        }
+
+        $controllerName = "{$modelName}Controller";
+        $path = "{$dir}/{$controllerName}.php";
+
+        $variable = Str::camel($modelName);
+        $modelClass = "App\\Models\\{$modelName}";
+        $tableName = (new $modelClass)->getTable();
+
+        // Detect Relations for Eager Loading
+        $relations = [];
+        $reflection = new \ReflectionClass($modelClass);
+        foreach ($reflection->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
+            if ($method->getDeclaringClass()->getName() === $modelClass && $method->getNumberOfParameters() === 0) {
+                $relations[] = $method->getName();
+            }
+        }
+        $with = count($relations) ? "with(['" . implode("','", $relations) . "'])" : "query()";
+
+        $stub = "<?php
+
+namespace App\Http\Controllers\Api\\{$version};
+
+use App\Http\Controllers\Controller;
+use App\Models\\{$modelName};
+use App\Http\Requests\Store{$modelName}Request;
+use App\Http\Requests\Update{$modelName}Request;
+use App\Http\Resources\\{$modelName}Resource;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Schema;
 
 class {$controllerName} extends Controller
 {
@@ -390,6 +576,48 @@ class {$controllerName} extends Controller
     }
 
     protected function appendRoutes($modelName, $version)
+    {
+        $routeFile = base_path('routes/api.php');
+        $content = $this->files->get($routeFile);
+
+        $slug = Str::kebab(Str::plural($modelName));
+        $vLower = strtolower($version);
+        $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
+
+        // Define the specific routes to add
+        $bulkRoute = "    Route::post('{$slug}/bulk', [\\{$controller}::class, 'bulkStore']);";
+        $resourceRoute = "    Route::apiResource('{$slug}', \\{$controller}::class);";
+
+        // 1. Skip if the resource route already exists
+        if (str_contains($content, "apiResource('{$slug}'")) {
+            $this->info("- Routes for {$slug} already exist.");
+            return;
+        }
+
+        $groupPattern = "Route::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {";
+
+        if (str_contains($content, $groupPattern)) {
+            // 2. Inject into existing group
+            $pos = strpos($content, $groupPattern);
+            $insertPos = strpos($content, "});", $pos);
+
+            if ($insertPos !== false) {
+                // Combine bulk and resource routes
+                $combinedRoutes = $bulkRoute . "\n" . $resourceRoute . "\n";
+                $updatedContent = substr_replace($content, $combinedRoutes, $insertPos, 0);
+
+                $this->files->put($routeFile, $updatedContent);
+                $this->info("- Added Bulk and Resource routes for {$slug} to existing {$vLower} group.");
+            }
+        } else {
+            // 3. Create new group at end of file if it doesn't exist
+            $newGroup = "\nRoute::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {\n{$bulkRoute}\n{$resourceRoute}\n});\n";
+            $this->files->append($routeFile, $newGroup);
+            $this->info("- Created new {$vLower} group with Bulk and Resource routes for {$slug}.");
+        }
+    }
+
+    protected function appendRoutesV1($modelName, $version)
     {
         $routeFile = base_path('routes/api.php');
         $content = $this->files->get($routeFile);
