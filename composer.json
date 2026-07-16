@@ -1,11 +1,33 @@
 {
     "name": "charlesmasinde/api-scaffolder",
-    "description": "Custom API Module generator for Laravel 12",
-    "type": "library",
+    "description": "Generate full API modules (Controller, Requests, Resource, Policy, Routes) from Eloquent models.",
+    "keywords": [
+        "laravel",
+        "api",
+        "scaffold",
+        "generator",
+        "crud"
+    ],
     "license": "MIT",
+    "type": "library",
+    "require": {
+        "php": "^8.2",
+        "illuminate/console": "^11.0|^12.0",
+        "illuminate/filesystem": "^11.0|^12.0",
+        "illuminate/support": "^11.0|^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0",
+        "phpunit/phpunit": "^11.0"
+    },
     "autoload": {
         "psr-4": {
             "CharlesMasinde\\ApiScaffolder\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "CharlesMasinde\\ApiScaffolder\\Tests\\": "tests/"
         }
     },
     "extra": {
@@ -15,8 +37,6 @@
             ]
         }
     },
-    "require": {
-        "php": "^8.2",
-        "laravel/framework": "^11.0|^12.0|^13.0"
-    }
+    "minimum-stability": "stable",
+    "prefer-stable": true
 }

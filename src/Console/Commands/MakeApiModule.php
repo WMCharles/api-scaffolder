@@ -1,18 +1,37 @@
 <?php
 
+declare(strict_types=1);
+
 namespace CharlesMasinde\ApiScaffolder\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Str;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use ReflectionClass;
+use ReflectionMethod;
+use ReflectionNamedType;
 
 class MakeApiModule extends Command
 {
-    protected $signature = 'make:api-module {name} {version=V1}';
-    protected $description = 'Generate a full CBC-ready API module with Controller, Requests, Resource, and Policy';
+    protected $signature = 'make:api-module
+        {name : The model name (e.g. Tag, BlogPost)}
+        {version=V1 : The API version prefix}
+        {--all : Generate all components without prompting}
+        {--only=* : Generate only specific components (controller, request, resource, policy, routes)}
+        {--force : Overwrite all existing files without prompting}';
+
+    protected $description = 'Generate a full API module with Controller, Requests, Resource, and Policy';
 
     protected Filesystem $files;
+
+    protected const COMPONENTS = [
+        'controller' => 'Controller (CRUD + bulk store)',
+        'request'    => 'Form Requests (Store + Update)',
+        'resource'   => 'API Resource',
+        'policy'     => 'Policy',
+        'routes'     => 'Routes (api.php)',
+    ];
 
     public function __construct()
     {
@@ -20,710 +39,556 @@ class MakeApiModule extends Command
         $this->files = new Filesystem();
     }
 
-    public function handle()
-    {
-        $name = $this->argument('name');
-        $version = strtoupper($this->argument('version'));
-        $modelName = Str::studly($name);
-        $storeRequest = "Store{$modelName}Request";
-        $updateRequest = "Update{$modelName}Request";
+    // ──────────────────────────────────────────────
+    //  Entry Point
+    // ──────────────────────────────────────────────
 
-        // Ensure the Model exists before proceeding
+    public function handle(): int
+    {
+        $modelName = Str::studly($this->argument('name'));
+        $version = strtoupper($this->argument('version'));
         $modelClass = "App\\Models\\{$modelName}";
-        if (!class_exists($modelClass)) {
-            $this->error("Model {$modelClass} does not exist! Create the model first.");
+
+        if (! class_exists($modelClass)) {
+            $this->error("Model {$modelClass} does not exist. Create the model first.");
+
+            return self::FAILURE;
+        }
+
+        $components = $this->resolveComponents();
+
+        if ($components === null || empty($components)) {
+            $this->warn('No components selected. Nothing to generate.');
+
+            return self::SUCCESS;
+        }
+
+        $this->info("Scaffolding API module: {$modelName} ({$version})");
+        $this->comment('  Components: ' . implode(', ', $components));
+        $this->newLine();
+
+        // Ordered generation map — requests & resource before controller
+        $generators = [
+            'request'    => fn () => $this->generateRequests($modelName, $modelClass),
+            'resource'   => fn () => $this->generateResource($modelName, $modelClass),
+            'policy'     => fn () => $this->generatePolicy($modelName),
+            'controller' => fn () => $this->generateController($modelName, $version, $modelClass),
+            'routes'     => fn () => $this->generateRoutes($modelName, $version),
+        ];
+
+        foreach ($generators as $component => $generator) {
+            if (in_array($component, $components, true)) {
+                $generator();
+            }
+        }
+
+        $this->newLine();
+        $this->info("Done. API module for {$modelName} is ready.");
+
+        return self::SUCCESS;
+    }
+
+    // ──────────────────────────────────────────────
+    //  Component Resolution
+    // ──────────────────────────────────────────────
+
+    /**
+     * Determine which components to generate.
+     *
+     * Priority:
+     *  1. --all flag      → everything, no prompt
+     *  2. --only=x,y      → specific components from CLI
+     *  3. Interactive menu → multi-choice prompt
+     *
+     * @return list<string>|null  Null on validation failure.
+     */
+    protected function resolveComponents(): ?array
+    {
+        // --all: generate everything
+        if ($this->option('all')) {
+            return array_keys(self::COMPONENTS);
+        }
+
+        // --only: parse and validate
+        $only = $this->option('only');
+
+        if (! empty($only)) {
+            return $this->parseOnlyOption($only);
+        }
+
+        // Interactive: show multi-choice menu
+        return $this->promptForComponents();
+    }
+
+    /**
+     * Parse --only=controller,request style input.
+     *
+     * @return list<string>|null
+     */
+    protected function parseOnlyOption(array $only): ?array
+    {
+        $requested = collect($only)
+            ->flatMap(fn (string $value) => explode(',', $value))
+            ->map(fn (string $value) => strtolower(trim($value)))
+            ->unique()
+            ->values()
+            ->all();
+
+        $valid = array_keys(self::COMPONENTS);
+        $invalid = array_diff($requested, $valid);
+
+        if (! empty($invalid)) {
+            $this->error('Invalid component(s): ' . implode(', ', $invalid));
+            $this->line('  Valid options: ' . implode(', ', $valid));
+
+            return null;
+        }
+
+        return $requested;
+    }
+
+    /**
+     * Show an interactive multi-choice prompt.
+     *
+     * @return list<string>
+     */
+    protected function promptForComponents(): array
+    {
+        $labels = array_values(self::COMPONENTS);
+
+        $selected = $this->choice(
+            'Which components would you like to generate? (comma-separated numbers, or "all")',
+            array_merge(['All components'], $labels),
+            '0', // default: All
+            null,
+            true, // multiple
+        );
+
+        // If "All components" was selected, return everything
+        if (in_array('All components', $selected, true)) {
+            return array_keys(self::COMPONENTS);
+        }
+
+        // Map labels back to keys
+        $labelToKey = array_flip(self::COMPONENTS);
+
+        return array_values(array_map(fn (string $label) => $labelToKey[$label], $selected));
+    }
+
+    // ──────────────────────────────────────────────
+    //  Generators
+    // ──────────────────────────────────────────────
+
+    protected function generateRequests(string $modelName, string $modelClass): void
+    {
+        $table = (new $modelClass)->getTable();
+        $columns = $this->parseColumnsFromMigration($table);
+
+        foreach (['Store', 'Update'] as $type) {
+            $className = "{$type}{$modelName}Request";
+            $path = app_path("Http/Requests/{$className}.php");
+
+            if ($this->shouldSkip($path, $className)) {
+                continue;
+            }
+
+            $rules = $this->buildValidationRules($columns, $table, strtolower($type));
+
+            $content = $this->loadStub('request', [
+                '{{CLASS}}' => $className,
+                '{{RULES}}' => $rules,
+            ]);
+
+            $this->writeFile($path, $content, "Request: {$className}");
+        }
+    }
+
+    protected function generateResource(string $modelName, string $modelClass): void
+    {
+        $path = app_path("Http/Resources/{$modelName}Resource.php");
+
+        if ($this->shouldSkip($path, "{$modelName}Resource")) {
             return;
         }
 
-        $this->info("🚀 Scaffolding API Module: {$modelName} ({$version})");
+        $table = (new $modelClass)->getTable();
+        $columns = Schema::getColumnListing($table);
+        $relations = $this->detectRelations($modelClass);
+        $skipColumns = config('api-scaffolder.skip_columns', []);
 
-        // 1. Create Requests
-        $this->call('make:request', ['name' => $storeRequest]);
-        $this->createRequest($modelName, $storeRequest, 'store', $modelClass);
-        $this->call('make:request', ['name' => $updateRequest]);
-        $this->createRequest($modelName, $updateRequest, 'update', $modelClass);
+        $mapping = [];
 
+        foreach ($columns as $column) {
+            if (in_array($column, $skipColumns, true)) {
+                continue;
+            }
 
-        // 2. Create Resource
-        $this->createResource($modelName);
-
-        // 3. Create Policy
-        $this->call('make:policy', [
-            'name' => "{$modelName}Policy",
-            '--model' => $modelName,
-        ]);
-
-        // 4. Create Controller
-        $this->createController($modelName, $version);
-
-        // 5. Append Routes
-        $this->appendRoutes($modelName, $version);
-
-        $this->info("✅ API Module for {$modelName} is ready");
-    }
-
-    protected function createRequest($modelName, $requestName, $type, $modelClass)
-    {
-        $dir = app_path("Http/Requests");
-        if (!$this->files->isDirectory($dir)) {
-            $this->files->makeDirectory($dir, 0755, true);
+            $mapping[] = "'{$column}' => \$this->{$column}";
         }
 
-        $path = "{$dir}/{$requestName}.php";
-        $table = (new $modelClass)->getTable();
-        $migrationFiles = glob(database_path("migrations/*.php"));
+        // Parent relations (belongsTo) — include the related name
+        foreach ($relations['belongsTo'] as $relation) {
+            $mapping[] = "'{$relation}_name' => \$this->{$relation}?->name";
+        }
 
+        // Child relations (hasMany / belongsToMany) — conditional loading
+        foreach ($relations['hasMany'] as $relation) {
+            $mapping[] = "'{$relation}' => \$this->whenLoaded('{$relation}')";
+        }
+
+        $content = $this->loadStub('resource', [
+            '{{MODEL}}'   => $modelName,
+            '{{MAPPING}}' => implode(",\n            ", $mapping),
+        ]);
+
+        $this->writeFile($path, $content, "Resource: {$modelName}Resource");
+    }
+
+    protected function generatePolicy(string $modelName): void
+    {
+        $path = app_path("Policies/{$modelName}Policy.php");
+
+        if ($this->shouldSkip($path, "{$modelName}Policy")) {
+            return;
+        }
+
+        $this->call('make:policy', [
+            'name'    => "{$modelName}Policy",
+            '--model' => $modelName,
+        ]);
+    }
+
+    protected function generateController(string $modelName, string $version, string $modelClass): void
+    {
+        $dir = app_path("Http/Controllers/Api/{$version}");
+        $path = "{$dir}/{$modelName}Controller.php";
+
+        if ($this->shouldSkip($path, "{$modelName}Controller")) {
+            return;
+        }
+
+        $tableName = (new $modelClass)->getTable();
+        $relations = $this->detectRelations($modelClass);
+        $allRelations = array_merge($relations['belongsTo'], $relations['hasMany']);
+        $variable = Str::camel($modelName);
+        $perPage = config('api-scaffolder.default_per_page', 100);
+
+        $withClause = count($allRelations)
+            ? "with(['" . implode("','", $allRelations) . "'])"
+            : 'query()';
+
+        $relationsArray = count($allRelations)
+            ? "['" . implode("','", $allRelations) . "']"
+            : '[]';
+
+        $plural = Str::plural($modelName);
+        $pluralLower = strtolower($plural);
+
+        // User ID assignment blocks
+        $autoAssign = config('api-scaffolder.auto_assign_user_id', true);
+        $userIdAssignment = '';
+        $bulkUserIdAssignment = '';
+
+        if ($autoAssign) {
+            $userIdAssignment = <<<PHP
+if (Schema::hasColumn('{$tableName}', 'user_id')) {
+            \$data['user_id'] = \$request->user()->id;
+        }
+PHP;
+
+            $bulkUserIdAssignment = <<<PHP
+if (Schema::hasColumn('{$tableName}', 'user_id')) {
+            \$userId = \$request->user()->id;
+            \$items = array_map(fn (array \$item) => array_merge(\$item, ['user_id' => \$userId]), \$items);
+        }
+PHP;
+        }
+
+        $content = $this->loadStub('controller.api', [
+            '{{VERSION}}'                 => $version,
+            '{{MODEL}}'                   => $modelName,
+            '{{VARIABLE}}'                => $variable,
+            '{{WITH}}'                    => $withClause,
+            '{{RELATIONS_ARRAY}}'         => $relationsArray,
+            '{{PER_PAGE}}'                => (string) $perPage,
+            '{{TABLE}}'                   => $tableName,
+            '{{PLURAL}}'                  => $plural,
+            '{{PLURAL_LOWER}}'            => $pluralLower,
+            '{{USER_ID_ASSIGNMENT}}'      => $userIdAssignment,
+            '{{BULK_USER_ID_ASSIGNMENT}}' => $bulkUserIdAssignment,
+        ]);
+
+        $this->ensureDirectory($dir);
+        $this->writeFile($path, $content, "Controller: {$modelName}Controller");
+    }
+
+    protected function generateRoutes(string $modelName, string $version): void
+    {
+        $routeFile = base_path('routes/api.php');
+        $content = $this->files->get($routeFile);
+
+        $slug = Str::kebab(Str::plural($modelName));
+        $vLower = strtolower($version);
+        $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
+        $middleware = config('api-scaffolder.middleware', 'auth:sanctum');
+
+        // Routes are append-only — duplicates are always skipped
+        if (str_contains($content, "apiResource('{$slug}'")) {
+            $this->comment("  Skipped: Routes for {$slug} (already registered)");
+
+            return;
+        }
+
+        $bulkRoute = "    Route::post('{$slug}/bulk', [\\{$controller}::class, 'bulkStore']);";
+        $resourceRoute = "    Route::apiResource('{$slug}', \\{$controller}::class);";
+        $routeLines = $bulkRoute . "\n" . $resourceRoute . "\n";
+
+        $groupPattern = "Route::prefix('{$vLower}')->middleware('{$middleware}')->group(function () {";
+
+        if (str_contains($content, $groupPattern)) {
+            $pos = strpos($content, $groupPattern);
+            $insertPos = strpos($content, '});', $pos);
+
+            if ($insertPos !== false) {
+                $content = substr_replace($content, $routeLines, $insertPos, 0);
+                $this->files->put($routeFile, $content);
+                $this->line("  Added routes for <info>{$slug}</info> to existing {$vLower} group");
+            }
+        } else {
+            $newGroup = "\nRoute::prefix('{$vLower}')->middleware('{$middleware}')->group(function () {\n{$routeLines}});\n";
+            $this->files->append($routeFile, $newGroup);
+            $this->line("  Created <info>{$vLower}</info> route group with {$slug}");
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    //  Relationship Detection
+    // ──────────────────────────────────────────────
+
+    /**
+     * Detect relationships using return type hints.
+     *
+     * Requires models to type-hint relationship methods, e.g.:
+     *   public function transactions(): HasMany
+     *
+     * @return array{belongsTo: list<string>, hasMany: list<string>}
+     */
+    protected function detectRelations(string $modelClass): array
+    {
+        $relations = ['belongsTo' => [], 'hasMany' => []];
+        $reflection = new ReflectionClass($modelClass);
+
+        foreach ($reflection->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+            if ($method->getDeclaringClass()->getName() !== $modelClass) {
+                continue;
+            }
+            if ($method->getNumberOfParameters() > 0) {
+                continue;
+            }
+
+            $returnType = $method->getReturnType();
+
+            if (! $returnType instanceof ReflectionNamedType) {
+                continue;
+            }
+
+            $typeName = $returnType->getName();
+
+            if ($this->isBelongsToRelation($typeName)) {
+                $relations['belongsTo'][] = $method->getName();
+            } elseif ($this->isHasManyRelation($typeName)) {
+                $relations['hasMany'][] = $method->getName();
+            }
+        }
+
+        return $relations;
+    }
+
+    protected function isBelongsToRelation(string $typeName): bool
+    {
+        return str_ends_with($typeName, 'BelongsTo')
+            && ! str_contains($typeName, 'Many');
+    }
+
+    protected function isHasManyRelation(string $typeName): bool
+    {
+        return str_ends_with($typeName, 'HasMany')
+            || str_ends_with($typeName, 'BelongsToMany')
+            || str_ends_with($typeName, 'HasManyThrough');
+    }
+
+    // ──────────────────────────────────────────────
+    //  Migration Parsing & Validation Rules
+    // ──────────────────────────────────────────────
+
+    /**
+     * Parse column definitions from the migration file for a given table.
+     *
+     * @return array<string, array{type: string, nullable: bool, options: string|null}>
+     */
+    protected function parseColumnsFromMigration(string $table): array
+    {
+        $migrationFiles = glob(database_path('migrations/*.php')) ?: [];
         $columns = [];
 
         foreach ($migrationFiles as $file) {
             $content = file_get_contents($file);
-            if (!str_contains($content, "Schema::create('{$table}'")) continue;
 
-            // UPDATED REGEX: Now captures the type, name, AND optional second argument (like enum options)
-            // Group 1: type, Group 2: name, Group 3: optional details (options array), Group 4: nullable
-            preg_match_all("/\\\$table->(\w+)\('([\w_]+)'(?:,\s*(.+?))?\)(->nullable\(\))?/", $content, $matches, PREG_SET_ORDER);
+            if (! str_contains($content, "Schema::create('{$table}'")) {
+                continue;
+            }
+
+            preg_match_all(
+                "/\\\$table->(\w+)\('([\w_]+)'(?:,\s*(.+?))?\)(->nullable\(\))?/",
+                $content,
+                $matches,
+                PREG_SET_ORDER
+            );
 
             foreach ($matches as $match) {
-                $typeName = $match[1];
-                $columnName = $match[2];
-                $options = $match[3] ?? null; // This will look like "['male', 'female']"
-                $nullable = isset($match[4]) && $match[4] === '->nullable()';
-
-                $columns[$columnName] = [
-                    'type' => $typeName,
-                    'nullable' => $nullable,
-                    'options' => $options,
+                $columns[$match[2]] = [
+                    'type'     => $match[1],
+                    'nullable' => isset($match[4]) && $match[4] === '->nullable()',
+                    'options'  => $match[3] ?? null,
                 ];
             }
         }
 
+        return $columns;
+    }
+
+    /**
+     * Build a formatted validation rules string from parsed columns.
+     */
+    protected function buildValidationRules(array $columns, string $table, string $type): string
+    {
+        $skipColumns = config('api-scaffolder.request_skip_columns', []);
+        $uniqueColumns = config('api-scaffolder.unique_columns', []);
         $rules = [];
+
         foreach ($columns as $name => $column) {
-            if (in_array($name, ['id', 'created_at', 'updated_at', 'deleted_at', 'user_id'])) continue;
+            if (in_array($name, $skipColumns, true)) {
+                continue;
+            }
 
             $nullable = $column['nullable'];
-            $rulePrefix = ($type === 'store') ? ($nullable ? 'sometimes' : 'required') : 'sometimes';
             $typeName = $column['type'];
 
-            $currentRules = [$rulePrefix];
+            $currentRules = [];
+            $currentRules[] = ($type === 'store' && ! $nullable) ? 'required' : 'sometimes';
 
-            // ENUM LOGIC
+            // Enum handling
             if ($typeName === 'enum' && $column['options']) {
-                // Clean the string "['male', 'female']" to "male,female"
                 $cleanOptions = str_replace(['[', ']', "'", '"', ' '], '', $column['options']);
                 $currentRules[] = "in:{$cleanOptions}";
             }
 
-            switch ($typeName) {
-                case 'string':
-                case 'text':
-                    $currentRules[] = 'string';
-                    break;
-                case 'integer':
-                case 'bigInteger':
-                case 'smallInteger':
-                    $currentRules[] = 'integer';
-                    break;
-                case 'decimal':
-                case 'float':
-                case 'numeric':
-                    $currentRules[] = 'numeric';
-                    break;
-                case 'boolean':
-                    $currentRules[] = 'boolean';
-                    break;
-                case 'date':
-                    $currentRules[] = 'date';
-                    break;
-            }
+            $currentRules = array_merge($currentRules, $this->mapColumnTypeToRule($typeName));
 
-            if ($type === 'store' && in_array($name, ['code', 'slug', 'admission_number'])) {
+            if ($type === 'store' && in_array($name, $uniqueColumns, true)) {
                 $currentRules[] = "unique:{$table},{$name}";
             }
 
             $rules[$name] = $currentRules;
         }
 
-        $rulesString = implode(",\n            ", array_map(
-            fn($k, $v) => "'" . $k . "' => ['" . implode("','", $v) . "']",
+        return implode(",\n            ", array_map(
+            fn (string $key, array $value) => "'{$key}' => ['" . implode("', '", $value) . "']",
             array_keys($rules),
-            $rules
+            $rules,
         ));
-
-        $stub = "<?php
-
-namespace App\Http\Requests;
-
-use Illuminate\Foundation\Http\FormRequest;
-
-class {$requestName} extends FormRequest
-{
-    public function authorize(): bool { return true; }
-
-    public function rules(): array
-    {
-        return [
-            {$rulesString}
-        ];
-    }
-}
-";
-        $this->files->put($path, $stub);
     }
 
-    protected function createResource($modelName)
-    {
-        $dir = app_path("Http/Resources");
-        if (!$this->files->isDirectory($dir)) {
-            $this->files->makeDirectory($dir, 0755, true);
-        }
-
-        $path = "{$dir}/{$modelName}Resource.php";
-        if ($this->files->exists($path)) return;
-
-        // 1. Get the table name from the model
-        $modelClass = "App\\Models\\{$modelName}";
-        $table = (new $modelClass)->getTable();
-
-        // 2. Fetch columns from the database
-        $columns = \Illuminate\Support\Facades\Schema::getColumnListing($table);
-
-        $mapping = [];
-        foreach ($columns as $column) {
-            // Skip timestamps and audit fields
-            if (in_array($column, ['created_at', 'updated_at', 'deleted_at', 'user_id'])) {
-                continue;
-            }
-
-            // 3. Detect Foreign Keys (e.g., student_id)
-            if (str_ends_with($column, '_id')) {
-                $relationBase = str_replace('_id', '', $column);
-
-                // snake_case for the relationship name (e.g., education_phase)
-                $relationSnake = \Illuminate\Support\Str::snake($relationBase);
-
-                // camelCase for a clean JSON key (e.g., education_phase_name)
-                $jsonKey = $relationSnake . '_name';
-
-                // Add the ID field
-                $mapping[] = "'{$column}' => \$this->{$column}";
-
-                // Add the "Smart" Name accessor using the null-safe operator
-                // This assumes the related table has a 'name' column (standard for your Mint machine)
-                $mapping[] = "'{$jsonKey}' => \$this->{$relationSnake}?->name";
-            } else {
-                // Normal columns
-                $mapping[] = "'{$column}' => \$this->{$column}";
-            }
-        }
-
-        $mappingString = implode(",\n            ", $mapping);
-
-        $stub = "<?php
-
-namespace App\Http\Resources;
-
-use Illuminate\Http\Request;
-use Illuminate\Http\Resources\Json\JsonResource;
-
-class {$modelName}Resource extends JsonResource
-{
     /**
-     * Transform the resource into an array.
+     * Map a migration column type to a Laravel validation rule.
      *
-     * @return array<string, mixed>
+     * @return list<string>
      */
-    public function toArray(Request \$request): array
+    protected function mapColumnTypeToRule(string $type): array
     {
-        return [
-            {$mappingString}
-        ];
-    }
-}
-";
-        $this->files->put($path, $stub);
-        $this->info("- Created Smart Resource: {$modelName}Resource");
+        return match ($type) {
+            'string', 'text'                           => ['string'],
+            'integer', 'bigInteger', 'smallInteger',
+            'unsignedBigInteger', 'unsignedInteger'    => ['integer'],
+            'decimal', 'float', 'numeric', 'double'    => ['numeric'],
+            'boolean'                                   => ['boolean'],
+            'date', 'dateTime', 'timestamp'             => ['date'],
+            'json', 'jsonb'                             => ['array'],
+            default                                     => [],
+        };
     }
 
-    protected function createController($modelName, $version)
+    // ──────────────────────────────────────────────
+    //  Stubs & File Helpers
+    // ──────────────────────────────────────────────
+
+    /**
+     * Load a stub file, allowing the consuming app to override it.
+     *
+     * Publish stubs with: php artisan vendor:publish --tag=api-scaffolder-stubs
+     */
+    protected function loadStub(string $name, array $replacements = []): string
     {
-        $dir = app_path("Http/Controllers/Api/{$version}");
-        if (!$this->files->isDirectory($dir)) {
+        $customPath = base_path("stubs/api-scaffolder/{$name}.stub");
+        $defaultPath = __DIR__ . '/../../Stubs/' . $name . '.stub';
+
+        $path = $this->files->exists($customPath) ? $customPath : $defaultPath;
+        $content = $this->files->get($path);
+
+        return str_replace(
+            array_keys($replacements),
+            array_values($replacements),
+            $content,
+        );
+    }
+
+    /**
+     * Check if a file should be skipped.
+     *
+     * - File doesn't exist → proceed (return false)
+     * - --force flag       → overwrite without asking (return false)
+     * - File exists        → ask the user: Overwrite or Skip
+     */
+    protected function shouldSkip(string $path, string $label): bool
+    {
+        if (! $this->files->exists($path)) {
+            return false;
+        }
+
+        if ($this->option('force')) {
+            $this->warn("  Overwriting: {$label}");
+
+            return false;
+        }
+
+        $action = $this->choice(
+            "  {$label} already exists. What would you like to do?",
+            ['Overwrite', 'Skip'],
+            1, // default: Skip
+        );
+
+        if ($action === 'Overwrite') {
+            $this->warn("  Overwriting: {$label}");
+
+            return false;
+        }
+
+        $this->comment("  Skipped: {$label}");
+
+        return true;
+    }
+
+    protected function ensureDirectory(string $dir): void
+    {
+        if (! $this->files->isDirectory($dir)) {
             $this->files->makeDirectory($dir, 0755, true);
         }
-
-        $controllerName = "{$modelName}Controller";
-        $path = "{$dir}/{$controllerName}.php";
-
-        $variable = Str::camel($modelName);
-        $modelClass = "App\\Models\\{$modelName}";
-        $tableName = (new $modelClass)->getTable();
-
-        // Detect Relations for Eager Loading
-        $relations = [];
-        $reflection = new \ReflectionClass($modelClass);
-        foreach ($reflection->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
-            if ($method->getDeclaringClass()->getName() === $modelClass && $method->getNumberOfParameters() === 0) {
-                $relations[] = $method->getName();
-            }
-        }
-        $with = count($relations) ? "with(['" . implode("','", $relations) . "'])" : "query()";
-
-        $stub = "<?php
-
-namespace App\Http\Controllers\Api\\{$version};
-
-use App\Http\Controllers\Controller;
-use App\Models\\{$modelName};
-use App\Http\Requests\Store{$modelName}Request;
-use App\Http\Requests\Update{$modelName}Request;
-use App\Http\Resources\\{$modelName}Resource;
-use Illuminate\Http\Request;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Validator;
-
-class {$controllerName} extends Controller
-{
-    /**
-     * Display a paginated listing of the resource.
-     */
-    public function index(Request \$request)
-    {
-        \$perPage = \$request->get('per_page', 100);
-        \${$variable}s = {$modelName}::{$with}->paginate(\$perPage);
-
-        return {$modelName}Resource::collection(\${$variable}s)->additional([
-            'status' => 'success',
-            'message' => 'Records retrieved successfully'
-        ]);
     }
 
-    /**
-     * Store a newly created resource in storage.
-     */
-    public function store(Store{$modelName}Request \$request)
+    protected function writeFile(string $path, string $content, string $label): void
     {
-        \$data = \$request->validated();
-
-        if (Schema::hasColumn('{$tableName}', 'user_id')) {
-            \$data['user_id'] = \$request->user()->id;
-        }
-
-        \${$variable} = {$modelName}::create(\$data);
-        
-        return (new {$modelName}Resource(\${$variable}))
-            ->additional([
-                'status' => 'success',
-                'message' => 'Record created successfully'
-            ])
-            ->response()
-            ->setStatusCode(201);
-    }
-
-    /**
-     * Bulk store multiple resources.
-     */
-    public function bulkStore(Request \$request): JsonResponse
-    {
-        \$data = \$request->all();
-        
-        // Get rules from the StoreRequest class
-        \$rules = (new Store{$modelName}Request())->rules();
-        
-        // Map rules to array syntax (e.g., 'name' becomes '*.name')
-        \$bulkRules = [];
-        foreach (\$rules as \$key => \$rule) {
-            \$bulkRules[\"*.\$key\"] = \$rule;
-        }
-
-        \$validator = Validator::make(\$data, \$bulkRules);
-
-        if (\$validator->fails()) {
-            return response()->json([
-                'status' => 'error',
-                'errors' => \$validator->errors()
-            ], 422);
-        }
-
-        \$userId = \$request->user()->id;
-        \$hasUserId = Schema::hasColumn('{$tableName}', 'user_id');
-        \$createdCount = 0;
-
-        DB::transaction(function () use (\$data, \$userId, \$hasUserId, &\$createdCount) {
-            foreach (\$data as \$item) {
-                if (\$hasUserId) {
-                    \$item['user_id'] = \$userId;
-                }
-                {$modelName}::create(\$item);
-                \$createdCount++;
-            }
-        });
-
-        return response()->json([
-            'status' => 'success',
-            'message' => \"{\$createdCount} records created successfully\"
-        ], 201);
-    }
-
-    /**
-     * Display the specified resource.
-     */
-    public function show(\$id)
-    {
-        \${$variable} = {$modelName}::{$with}->find(\$id);
-        
-        if (!\${$variable}) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Record not found'
-            ], 404);
-        }
-
-        return (new {$modelName}Resource(\${$variable}))->additional([
-            'status' => 'success'
-        ]);
-    }
-
-    /**
-     * Update the specified resource in storage.
-     */
-    public function update(Update{$modelName}Request \$request, \$id)
-    {
-        \${$variable} = {$modelName}::find(\$id);
-
-        if (!\${$variable}) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Record not found'
-            ], 404);
-        }
-        
-        \${$variable}->update(\$request->validated());
-        
-        return (new {$modelName}Resource(\${$variable}))->additional([
-            'status' => 'success',
-            'message' => 'Record updated successfully'
-        ]);
-    }
-
-    /**
-     * Remove the specified resource from storage.
-     */
-    public function destroy(\$id)
-    {
-        \${$variable} = {$modelName}::find(\$id);
-
-        if (!\${$variable}) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Record not found'
-            ], 404);
-        }
-
-        \${$variable}->delete();
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Record deleted successfully'
-        ]);
-    }
-}";
-        $this->files->put($path, $stub);
-    }
-
-    protected function createControllerOld($modelName, $version)
-    {
-        $dir = app_path("Http/Controllers/Api/{$version}");
-        if (!$this->files->isDirectory($dir)) {
-            $this->files->makeDirectory($dir, 0755, true);
-        }
-
-        $controllerName = "{$modelName}Controller";
-        $path = "{$dir}/{$controllerName}.php";
-
-        $variable = Str::camel($modelName);
-        $modelClass = "App\\Models\\{$modelName}";
-        $tableName = (new $modelClass)->getTable();
-
-        // Detect Relations for Eager Loading
-        $relations = [];
-        $reflection = new \ReflectionClass($modelClass);
-        foreach ($reflection->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
-            if ($method->getDeclaringClass()->getName() === $modelClass && $method->getNumberOfParameters() === 0) {
-                $relations[] = $method->getName();
-            }
-        }
-        $with = count($relations) ? "with(['" . implode("','", $relations) . "'])" : "query()";
-
-        $stub = "<?php
-
-namespace App\Http\Controllers\Api\\{$version};
-
-use App\Http\Controllers\Controller;
-use App\Models\\{$modelName};
-use App\Http\Requests\Store{$modelName}Request;
-use App\Http\Requests\Update{$modelName}Request;
-use App\Http\Resources\\{$modelName}Resource;
-use Illuminate\Http\Request;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Schema;
-
-class {$controllerName} extends Controller
-{
-    /**
-     * Display a paginated listing of the resource.
-     */
-    public function index(Request \$request)
-    {
-        \$perPage = \$request->get('per_page', 100);
-        \${$variable}s = {$modelName}::{$with}->paginate(\$perPage);
-
-        return {$modelName}Resource::collection(\${$variable}s)->additional([
-            'status' => 'success',
-            'message' => 'Records retrieved successfully'
-        ]);
-    }
-
-    /**
-     * Store a newly created resource in storage.
-     */
-    public function store(Store{$modelName}Request \$request)
-    {
-        \$data = \$request->validated();
-
-        // Assign authenticated user_id via Sanctum if column exists
-        if (Schema::hasColumn('{$tableName}', 'user_id')) {
-            \$data['user_id'] = \$request->user()->id;
-        }
-
-        \${$variable} = {$modelName}::create(\$data);
-        
-        return (new {$modelName}Resource(\${$variable}))
-            ->additional([
-                'status' => 'success',
-                'message' => 'Record created successfully'
-            ])
-            ->response()
-            ->setStatusCode(201);
-    }
-
-    /**
-     * Display the specified resource.
-     */
-    public function show(\$id)
-    {
-        \${$variable} = {$modelName}::{$with}->find(\$id);
-        
-        if (!\${$variable}) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Record not found'
-            ], 404);
-        }
-
-        return (new {$modelName}Resource(\${$variable}))->additional([
-            'status' => 'success'
-        ]);
-    }
-
-    /**
-     * Update the specified resource in storage.
-     */
-    public function update(Update{$modelName}Request \$request, \$id)
-    {
-        \${$variable} = {$modelName}::find(\$id);
-
-        if (!\${$variable}) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Record not found'
-            ], 404);
-        }
-        
-        \${$variable}->update(\$request->validated());
-        
-        return (new {$modelName}Resource(\${$variable}))->additional([
-            'status' => 'success',
-            'message' => 'Record updated successfully'
-        ]);
-    }
-
-    /**
-     * Remove the specified resource from storage.
-     */
-    public function destroy(\$id)
-    {
-        \${$variable} = {$modelName}::find(\$id);
-
-        if (!\${$variable}) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Record not found'
-            ], 404);
-        }
-
-        \${$variable}->delete();
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Record deleted successfully'
-        ]);
-    }
-}";
-        $this->files->put($path, $stub);
-    }
-
-    protected function appendRoutes($modelName, $version)
-    {
-        $routeFile = base_path('routes/api.php');
-        $content = $this->files->get($routeFile);
-
-        $slug = Str::kebab(Str::plural($modelName));
-        $vLower = strtolower($version);
-        $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
-
-        // Define the specific routes to add
-        $bulkRoute = "    Route::post('{$slug}/bulk', [\\{$controller}::class, 'bulkStore']);";
-        $resourceRoute = "    Route::apiResource('{$slug}', \\{$controller}::class);";
-
-        // 1. Skip if the resource route already exists
-        if (str_contains($content, "apiResource('{$slug}'")) {
-            $this->info("- Routes for {$slug} already exist.");
-            return;
-        }
-
-        $groupPattern = "Route::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {";
-
-        if (str_contains($content, $groupPattern)) {
-            // 2. Inject into existing group
-            $pos = strpos($content, $groupPattern);
-            $insertPos = strpos($content, "});", $pos);
-
-            if ($insertPos !== false) {
-                // Combine bulk and resource routes
-                $combinedRoutes = $bulkRoute . "\n" . $resourceRoute . "\n";
-                $updatedContent = substr_replace($content, $combinedRoutes, $insertPos, 0);
-
-                $this->files->put($routeFile, $updatedContent);
-                $this->info("- Added Bulk and Resource routes for {$slug} to existing {$vLower} group.");
-            }
-        } else {
-            // 3. Create new group at end of file if it doesn't exist
-            $newGroup = "\nRoute::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {\n{$bulkRoute}\n{$resourceRoute}\n});\n";
-            $this->files->append($routeFile, $newGroup);
-            $this->info("- Created new {$vLower} group with Bulk and Resource routes for {$slug}.");
-        }
-    }
-
-    protected function appendRoutesV1($modelName, $version)
-    {
-        $routeFile = base_path('routes/api.php');
-        $content = $this->files->get($routeFile);
-
-        $slug = Str::kebab(Str::plural($modelName));
-        $vLower = strtolower($version);
-        $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
-
-        // The line we want to add
-        $newRoute = "    Route::apiResource('{$slug}', \\{$controller}::class);";
-
-        // 1. Check if the resource already exists to avoid duplicates
-        if (str_contains($content, "apiResource('{$slug}'")) {
-            $this->info("- Route for {$slug} already exists.");
-            return;
-        }
-
-        // 2. Define the search pattern for the versioned group
-        $groupPattern = "Route::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {";
-
-        if (str_contains($content, $groupPattern)) {
-            // Find the position of the group
-            $pos = strpos($content, $groupPattern);
-
-            // Find the first closing brace AFTER the group declaration
-            // We use a simple approach: find the next '});' after the group starts
-            $insertPos = strpos($content, "});", $pos);
-
-            if ($insertPos !== false) {
-                // Inject the new route before the closing brace
-                $updatedContent = substr_replace($content, $newRoute . "\n", $insertPos, 0);
-                $this->files->put($routeFile, $updatedContent);
-                $this->info("- Added {$slug} to existing {$vLower} route group.");
-            }
-        } else {
-            // 3. If no group exists for this version, create a new one at the end
-            $route = "\nRoute::prefix('{$vLower}')->middleware('auth:sanctum')->group(function () {\n{$newRoute}\n});\n";
-            $this->files->append($routeFile, $route);
-            $this->info("- Created new route group for {$vLower} and added {$slug}.");
-        }
-    }
-
-    protected function generateRules($table, $type)
-    {
-        // 1. Get the column list from the actual database table
-        // Note: The migration MUST be run (php artisan migrate) for this to work
-        try {
-            $columns = Schema::getColumnListing($table);
-        } catch (\Exception $e) {
-            $this->error("Could not read table '{$table}'. Ensure you have run php artisan migrate.");
-            return "'name' => ['required', 'string']"; // Fallback
-        }
-
-        $rules = "";
-
-        // 2. Define columns to skip (System columns)
-        $exclude = ['id', 'created_at', 'updated_at', 'deleted_at', 'user_id', 'email_verified_at'];
-
-        foreach ($columns as $column) {
-            if (in_array($column, $exclude)) continue;
-
-            // Get column metadata (requires doctrine/dbal)
-            $columnType = Schema::getColumnType($table, $column);
-            $isNullable = !Schema::getConnection()->getDoctrineColumn($table, $column)->getNotnull();
-
-            // Start building the rule string
-            $ruleArray = [];
-
-            // Requirement logic
-            if ($type === 'store') {
-                $ruleArray[] = $isNullable ? "'sometimes'" : "'required'";
-            } else {
-                $ruleArray[] = "'sometimes'";
-            }
-
-            // Type guessing logic
-            switch ($columnType) {
-                case 'integer':
-                case 'bigint':
-                case 'smallint':
-                    $ruleArray[] = "'integer'";
-                    break;
-                case 'boolean':
-                    $ruleArray[] = "'boolean'";
-                    break;
-                case 'decimal':
-                case 'float':
-                    $ruleArray[] = "'numeric'";
-                    break;
-                case 'datetime':
-                case 'date':
-                    $ruleArray[] = "'date'";
-                    break;
-                default:
-                    $ruleArray[] = "'string'";
-                    $ruleArray[] = "'max:255'";
-            }
-
-            // Check for uniqueness (common for 'slug', 'code', 'email')
-            if (in_array($column, ['slug', 'code', 'email'])) {
-                $ruleArray[] = "'unique:{$table},{$column}'";
-            }
-
-            $rules .= "\n            '{$column}' => [" . implode(", ", $ruleArray) . "],";
-        }
-
-        return trim($rules);
+        $this->ensureDirectory(dirname($path));
+        $this->files->put($path, $content);
+        $this->line("  Created <info>{$label}</info>");
     }
 }
