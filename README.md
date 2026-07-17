@@ -133,7 +133,7 @@ The controller automatically eager-loads all detected relationships.
 ## Requirements
 
 - PHP 8.2+
-- Laravel 11 or 12
+- Laravel 11, 12, or 13
 - Models must have return type hints on relationship methods
 
 ## License
