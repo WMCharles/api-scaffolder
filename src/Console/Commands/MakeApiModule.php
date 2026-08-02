@@ -46,13 +46,27 @@ class MakeApiModule extends Command
     public function handle(): int
     {
         $modelName = Str::studly($this->argument('name'));
-        $version = strtoupper($this->argument('version'));
+        // UPDATE : Normalize simple and nested API version paths without producing invalid PHP namespaces.
+        $version = collect(preg_split('/[\\\\\/]+/', trim((string) $this->argument('version'), '/\\\\')))
+            ->filter()
+            ->map(fn (string $segment): string => preg_match('/^v\d+$/i', $segment)
+                ? strtoupper($segment)
+                : Str::studly($segment))
+            ->implode('/');
         $modelClass = "App\\Models\\{$modelName}";
 
         if (! class_exists($modelClass)) {
-            $this->error("Model {$modelClass} does not exist. Create the model first.");
+            // UPDATE : Generate a missing model from its snake-case plural table through Reliese.
+            $table = Str::snake(Str::pluralStudly($modelName));
+            $this->info("Model {$modelClass} does not exist. Generating it from table {$table}.");
 
-            return self::FAILURE;
+            $exitCode = $this->call('code:models', ['--table' => $table]);
+
+            if ($exitCode !== self::SUCCESS || ! class_exists($modelClass)) {
+                $this->error("Reliese could not generate model {$modelClass} from table {$table}.");
+
+                return self::FAILURE;
+            }
         }
 
         $components = $this->resolveComponents();
@@ -207,8 +221,9 @@ class MakeApiModule extends Command
     {
         $path = app_path("Http/Resources/{$modelName}Resource.php");
 
-        if ($this->shouldSkip($path, "{$modelName}Resource")) {
-            return;
+        // UPDATE : Always regenerate the resource so model changes are reflected in existing files.
+        if ($this->files->exists($path)) {
+            $this->warn("  Overwriting: {$modelName}Resource");
         }
 
         $table = (new $modelClass)->getTable();
@@ -283,6 +298,8 @@ class MakeApiModule extends Command
 
         $plural = Str::plural($modelName);
         $pluralLower = strtolower($plural);
+        // UPDATE : Convert the normalized filesystem path into a valid PHP namespace.
+        $versionNamespace = str_replace('/', '\\', $version);
 
         // User ID assignment blocks
         $autoAssign = config('api-scaffolder.auto_assign_user_id', true);
@@ -305,7 +322,7 @@ PHP;
         }
 
         $content = $this->loadStub('controller.api', [
-            '{{VERSION}}'                 => $version,
+            '{{VERSION}}'                 => $versionNamespace,
             '{{MODEL}}'                   => $modelName,
             '{{VARIABLE}}'                => $variable,
             '{{WITH}}'                    => $withClause,
@@ -324,12 +341,28 @@ PHP;
 
     protected function generateRoutes(string $modelName, string $version): void
     {
+        // UPDATE : Route RideMeds API scopes through their existing protected route files.
+        $routeMap = [
+            'V1/Admin'  => ['file' => 'api_v1_admin.php', 'middleware' => "['auth:sanctum', 'abilities:admin-web', 'active', 'internal']", 'name' => 'admin'],
+            'V1/Client' => ['file' => 'api_v1_client.php', 'middleware' => "['auth:sanctum', 'abilities:client-mobile', 'active', 'client']", 'name' => null],
+            'V1/Driver' => ['file' => 'api_v1_driver.php', 'middleware' => "['auth:sanctum', 'abilities:driver-mobile', 'active', 'driver']", 'name' => null],
+            'V1/Portal' => ['file' => 'api_v1_portal.php', 'middleware' => "['auth:sanctum', 'abilities:portal-web', 'active']", 'name' => null],
+        ];
+
+        if (isset($routeMap[$version])) {
+            $this->generateScopedRoutes($modelName, $version, $routeMap[$version]);
+
+            return;
+        }
+
         $routeFile = base_path('routes/api.php');
         $content = $this->files->get($routeFile);
 
         $slug = Str::kebab(Str::plural($modelName));
         $vLower = strtolower($version);
-        $controller = "App\\Http\\Controllers\\Api\\{$version}\\{$modelName}Controller";
+        // UPDATE : Use namespace separators for nested API controller route references.
+        $versionNamespace = str_replace('/', '\\', $version);
+        $controller = "App\\Http\\Controllers\\Api\\{$versionNamespace}\\{$modelName}Controller";
         $middleware = config('api-scaffolder.middleware', 'auth:sanctum');
 
         // Routes are append-only — duplicates are always skipped
@@ -359,6 +392,52 @@ PHP;
             $this->files->append($routeFile, $newGroup);
             $this->line("  Created <info>{$vLower}</info> route group with {$slug}");
         }
+    }
+
+    /**
+     * @param array{file: string, middleware: string, name: string|null} $routeConfig
+     */
+    protected function generateScopedRoutes(string $modelName, string $version, array $routeConfig): void
+    {
+        // UPDATE : Append generated routes to an existing RideMeds protected scope.
+        $routeFile = base_path("routes/{$routeConfig['file']}");
+        $content = $this->files->get($routeFile);
+        $slug = Str::kebab(Str::plural($modelName));
+
+        if (str_contains($content, "apiResource('{$slug}'")) {
+            $this->comment("  Skipped: Routes for {$slug} (already registered)");
+
+            return;
+        }
+
+        $groupPattern = "Route::middleware({$routeConfig['middleware']})->group(function (): void {";
+        $groupPosition = strpos($content, $groupPattern);
+        $insertPosition = strrpos($content, '});');
+
+        if ($groupPosition === false || $insertPosition === false || $insertPosition < $groupPosition) {
+            $this->error("Could not find the protected route group in {$routeConfig['file']}.");
+
+            return;
+        }
+
+        $versionNamespace = str_replace('/', '\\', $version);
+        $controller = "App\\Http\\Controllers\\Api\\{$versionNamespace}\\{$modelName}Controller";
+        $bulkRoute = "Route::post('{$slug}/bulk', [\\{$controller}::class, 'bulkStore'])->name('{$slug}.bulk');";
+        $resourceRoute = "Route::apiResource('{$slug}', \\{$controller}::class);";
+
+        if ($routeConfig['name'] !== null) {
+            $routes = "    Route::name('{$routeConfig['name']}.')->group(function (): void {\n"
+                . "        {$bulkRoute}\n"
+                . "        {$resourceRoute}\n"
+                . "    });\n";
+        } else {
+            $routes = "\n    {$bulkRoute}\n"
+                . "    {$resourceRoute}\n";
+        }
+
+        $content = substr_replace($content, $routes, $insertPosition, 0);
+        $this->files->put($routeFile, $content);
+        $this->line("  Added scoped routes for <info>{$slug}</info> to {$routeConfig['file']}");
     }
 
     // ──────────────────────────────────────────────
