@@ -62,8 +62,31 @@ class MakeApiModule extends Command
 
             $exitCode = $this->call('code:models', ['--table' => $table]);
 
-            if ($exitCode !== self::SUCCESS || ! class_exists($modelClass)) {
+            if ($exitCode !== self::SUCCESS) {
                 $this->error("Reliese could not generate model {$modelClass} from table {$table}.");
+
+                return self::FAILURE;
+            }
+
+            // UPDATE : Load the generated model directly because Composer caches the initial missing-class lookup.
+            $modelPath = app_path("Models/{$modelName}.php");
+
+            if (! $this->files->exists($modelPath)) {
+                $this->error("Reliese completed but did not create {$modelPath}.");
+
+                return self::FAILURE;
+            }
+
+            try {
+                require_once $modelPath;
+            } catch (\Throwable $exception) {
+                $this->error("Reliese created {$modelPath}, but the model could not be loaded: {$exception->getMessage()}");
+
+                return self::FAILURE;
+            }
+
+            if (! class_exists($modelClass, false)) {
+                $this->error("Reliese created {$modelPath}, but it does not define {$modelClass}.");
 
                 return self::FAILURE;
             }
@@ -195,8 +218,10 @@ class MakeApiModule extends Command
 
     protected function generateRequests(string $modelName, string $modelClass): void
     {
-        $table = (new $modelClass)->getTable();
-        $columns = $this->parseColumnsFromMigration($table);
+        $model = new $modelClass;
+        $table = $model->getTable();
+        // UPDATE : Generate request fields from the Reliese model intersected with its live table schema.
+        $columns = $this->requestColumnsFromModelSchema($model);
 
         foreach (['Store', 'Update'] as $type) {
             $className = "{$type}{$modelName}Request";
@@ -501,36 +526,98 @@ PHP;
     // ──────────────────────────────────────────────
 
     /**
-     * Parse column definitions from the migration file for a given table.
+     * Read request fields from the model's fillable list and active database schema.
      *
-     * @return array<string, array{type: string, nullable: bool, options: string|null}>
+     * @return array<string, array{
+     *     type: string,
+     *     cast: string|null,
+     *     nullable: bool,
+     *     has_default: bool,
+     *     unique: bool,
+     *     foreign_table: string|null,
+     *     foreign_column: string|null
+     * }>
      */
-    protected function parseColumnsFromMigration(string $table): array
+    protected function requestColumnsFromModelSchema(object $model): array
     {
-        $migrationFiles = glob(database_path('migrations/*.php')) ?: [];
-        $columns = [];
+        $table = $model->getTable();
+        $schema = $model->getConnection()->getSchemaBuilder();
 
-        foreach ($migrationFiles as $file) {
-            $content = file_get_contents($file);
+        if (! $schema->hasTable($table)) {
+            throw new \RuntimeException("Cannot generate requests because table {$table} does not exist.");
+        }
 
-            if (! str_contains($content, "Schema::create('{$table}'")) {
+        $fillable = array_flip($model->getFillable());
+        $casts = $model->getCasts();
+        $skipColumns = config('api-scaffolder.request_skip_columns', []);
+        $schemaColumns = $schema->getColumns($table);
+        $columnNames = array_column($schemaColumns, 'name');
+
+        foreach (array_keys($fillable) as $field) {
+            if (! in_array($field, $columnNames, true)) {
+                $this->warn("Skipping fillable field {$table}.{$field} because it is not a database column.");
+            }
+        }
+
+        $uniqueColumns = [];
+
+        foreach ($schema->getIndexes($table) as $index) {
+            if (! ($index['unique'] ?? false)) {
                 continue;
             }
 
-            preg_match_all(
-                "/\\\$table->(\w+)\('([\w_]+)'(?:,\s*(.+?))?\)(->nullable\(\))?/",
-                $content,
-                $matches,
-                PREG_SET_ORDER
-            );
+            $indexColumns = $index['columns'] ?? [];
 
-            foreach ($matches as $match) {
-                $columns[$match[2]] = [
-                    'type'     => $match[1],
-                    'nullable' => isset($match[4]) && $match[4] === '->nullable()',
-                    'options'  => $match[3] ?? null,
+            if (count($indexColumns) === 1) {
+                $uniqueColumns[$indexColumns[0]] = true;
+
+                continue;
+            }
+
+            if (count($indexColumns) > 1) {
+                $this->warn(
+                    "Composite unique index on {$table} (" . implode(', ', $indexColumns)
+                    . ') requires explicit request validation.'
+                );
+            }
+        }
+
+        $foreignKeys = [];
+
+        foreach ($schema->getForeignKeys($table) as $foreignKey) {
+            $localColumns = $foreignKey['columns'] ?? [];
+            $foreignColumns = $foreignKey['foreign_columns'] ?? [];
+
+            foreach ($localColumns as $position => $localColumn) {
+                $foreignKeys[$localColumn] = [
+                    'table'  => $foreignKey['foreign_table'] ?? null,
+                    'column' => $foreignColumns[$position] ?? null,
                 ];
             }
+        }
+
+        $columns = [];
+
+        foreach ($schemaColumns as $column) {
+            $name = $column['name'];
+
+            if (! isset($fillable[$name]) || in_array($name, $skipColumns, true)) {
+                continue;
+            }
+
+            $columns[$name] = [
+                'type'           => strtolower((string) ($column['type_name'] ?? $column['type'] ?? '')),
+                'cast'           => isset($casts[$name]) ? strtolower((string) $casts[$name]) : null,
+                'nullable'       => (bool) ($column['nullable'] ?? false),
+                'has_default'    => array_key_exists('default', $column) && $column['default'] !== null,
+                'unique'         => isset($uniqueColumns[$name]),
+                'foreign_table'  => $foreignKeys[$name]['table'] ?? null,
+                'foreign_column' => $foreignKeys[$name]['column'] ?? null,
+            ];
+        }
+
+        if ($columns === []) {
+            $this->warn("No request fields were found for model table {$table}.");
         }
 
         return $columns;
@@ -554,17 +641,30 @@ PHP;
             $typeName = $column['type'];
 
             $currentRules = [];
-            $currentRules[] = ($type === 'store' && ! $nullable) ? 'required' : 'sometimes';
+            $currentRules[] = ($type === 'store' && ! $nullable && ! $column['has_default'])
+                ? 'required'
+                : 'sometimes';
 
-            // Enum handling
-            if ($typeName === 'enum' && $column['options']) {
-                $cleanOptions = str_replace(['[', ']', "'", '"', ' '], '', $column['options']);
-                $currentRules[] = "in:{$cleanOptions}";
+            if ($nullable) {
+                $currentRules[] = 'nullable';
             }
 
-            $currentRules = array_merge($currentRules, $this->mapColumnTypeToRule($typeName));
+            $mappedRule = $this->mapColumnTypeToRule($typeName, $column['cast']);
 
-            if ($type === 'store' && in_array($name, $uniqueColumns, true)) {
+            if ($mappedRule !== null) {
+                $currentRules[] = $mappedRule;
+            } else {
+                $this->warn("No validation type mapping exists for {$table}.{$name} ({$typeName}).");
+            }
+
+            if ($column['foreign_table'] !== null) {
+                $currentRules[] = "exists:{$column['foreign_table']},{$column['foreign_column']}";
+            }
+
+            if (
+                $type === 'store'
+                && ($column['unique'] || in_array($name, $uniqueColumns, true))
+            ) {
                 $currentRules[] = "unique:{$table},{$name}";
             }
 
@@ -579,21 +679,48 @@ PHP;
     }
 
     /**
-     * Map a migration column type to a Laravel validation rule.
-     *
-     * @return list<string>
+     * Map a database schema type or model cast to a Laravel validation rule.
      */
-    protected function mapColumnTypeToRule(string $type): array
+    protected function mapColumnTypeToRule(string $type, ?string $cast): ?string
     {
-        return match ($type) {
-            'string', 'text'                           => ['string'],
-            'integer', 'bigInteger', 'smallInteger',
-            'unsignedBigInteger', 'unsignedInteger'    => ['integer'],
-            'decimal', 'float', 'numeric', 'double'    => ['numeric'],
-            'boolean'                                   => ['boolean'],
-            'date', 'dateTime', 'timestamp'             => ['date'],
-            'json', 'jsonb'                             => ['array'],
-            default                                     => [],
+        $normalizedCast = preg_replace('/:.*/', '', $cast ?? '');
+
+        if (in_array($normalizedCast, ['int', 'integer'], true)) {
+            return 'integer';
+        }
+
+        if (in_array($normalizedCast, ['float', 'double', 'decimal', 'real'], true)) {
+            return 'numeric';
+        }
+
+        if (in_array($normalizedCast, ['bool', 'boolean'], true)) {
+            return 'boolean';
+        }
+
+        if (in_array($normalizedCast, ['date', 'datetime', 'immutable_date', 'immutable_datetime'], true)) {
+            return 'date';
+        }
+
+        if (in_array($normalizedCast, ['array', 'json', 'object', 'collection'], true)) {
+            return 'array';
+        }
+
+        return match (true) {
+            str_contains($type, 'int') => 'integer',
+            str_contains($type, 'decimal'),
+            str_contains($type, 'numeric'),
+            str_contains($type, 'float'),
+            str_contains($type, 'double'),
+            str_contains($type, 'real') => 'numeric',
+            str_contains($type, 'bool') => 'boolean',
+            str_contains($type, 'date'),
+            str_contains($type, 'time') => 'date',
+            str_contains($type, 'json') => 'array',
+            str_contains($type, 'char'),
+            str_contains($type, 'text'),
+            str_contains($type, 'uuid'),
+            str_contains($type, 'enum') => 'string',
+            default => null,
         };
     }
 
